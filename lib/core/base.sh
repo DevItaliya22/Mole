@@ -1281,6 +1281,66 @@ prune_stale_mole_temp_files() {
         -mmin "+$max_age_minutes" -print0 2> /dev/null)
 }
 
+_mole_darwin_user_temp_dir() {
+    /usr/bin/getconf DARWIN_USER_TEMP_DIR 2> /dev/null
+}
+
+# A run killed before its exit trap leaves its registry and tracked temp
+# entries in TMPDIR, and macOS does not expire the per-user Darwin temp root
+# (2026-10-27: 25,412 Mole entries there, the oldest from July). Take only the
+# two names Mole creates, after the same one-day grace: `mole.registry.<pid>`
+# whose pid is gone, and `mole.` plus six letters or digits that is a regular
+# file with one link or an empty folder. Only the Darwin temp root qualifies,
+# never /tmp or a TMPDIR pointed at a user folder. Mole Mac's
+# TemporaryRootLeftoverPolicy applies the same contract.
+prune_stale_mole_tmpdir_leftovers() {
+    local root="${1:-}"
+    local max_age_minutes="${MOLE_TEMP_STALE_MINUTES:-1440}"
+    local darwin_temp="" resolved_root=""
+
+    [[ "$max_age_minutes" =~ ^[0-9]+$ ]] || max_age_minutes=1440
+    is_root_user && return 0
+    [[ -n "$root" && -d "$root" && ! -L "$root" && -O "$root" ]] || return 0
+
+    darwin_temp=$(_mole_darwin_user_temp_dir) || return 0
+    [[ -n "$darwin_temp" ]] || return 0
+    darwin_temp=$(cd -P "$darwin_temp" 2> /dev/null && pwd) || return 0
+    resolved_root=$(cd -P "$root" 2> /dev/null && pwd) || return 0
+    [[ "$resolved_root" == "$darwin_temp" ]] || return 0
+
+    # One process listing and one set difference instead of a probe per
+    # registry: the first run on a long-lived temp root can meet tens of
+    # thousands of entries. No listing means every owner is unknown.
+    local live_pids
+    live_pids=$(ps -axo pid= 2> /dev/null | tr -d ' ')
+    [[ "$live_pids" =~ [0-9] ]] || return 0
+
+    local uid token_glob
+    uid=$(id -u)
+    token_glob='mole.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]'
+    find "$resolved_root" -mindepth 1 -maxdepth 1 -name "$token_glob" -user "$uid" \
+        -mmin "+$max_age_minutes" -type f -links 1 \
+        -exec rm -f -- {} + 2> /dev/null || true # SAFE: exact Mole temp names in the Darwin temp root only
+    # rmdir refuses a folder that gained content since the scan.
+    find "$resolved_root" -mindepth 1 -maxdepth 1 -name "$token_glob" -user "$uid" \
+        -mmin "+$max_age_minutes" -type d -empty \
+        -exec rmdir -- {} + 2> /dev/null || true
+
+    # The second -name keeps only digits after the prefix, so every printed
+    # line is one pid and a crafted name cannot add a line. Names stay
+    # relative to the root so no path is rebuilt from text.
+    (
+        cd "$resolved_root" 2> /dev/null || exit 0
+        find . -mindepth 1 -maxdepth 1 -name 'mole.registry.[1-9]*' \
+            ! -name 'mole.registry.*[!0-9]*' -user "$uid" \
+            -mmin "+$max_age_minutes" -type f -links 1 -print 2> /dev/null |
+            sed 's#^\./mole\.registry\.##' |
+            grep -vxF -f <(printf '%s\n' "$live_pids") 2> /dev/null |
+            sed 's#^#mole.registry.#' | tr '\n' '\0' |
+            xargs -0 rm -f -- 2> /dev/null # SAFE: dead-owner Mole registries in the Darwin temp root only
+    ) || true
+}
+
 initialize_mole_temp_registry_path() {
     [[ -n "${MOLE_RESOLVED_TMPDIR:-}" ]] || return 1
 
@@ -1369,6 +1429,7 @@ ensure_mole_temp_root() {
     export MOLE_RESOLVED_TMPDIR
     initialize_mole_temp_registry_path || true
     prune_stale_mole_temp_files "$MOLE_RESOLVED_TMPDIR"
+    prune_stale_mole_tmpdir_leftovers "$MOLE_RESOLVED_TMPDIR"
 }
 
 prepare_mole_tmpdir() {
