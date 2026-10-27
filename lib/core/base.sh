@@ -1308,29 +1308,49 @@ prune_stale_mole_tmpdir_leftovers() {
     resolved_root=$(cd -P "$root" 2> /dev/null && pwd) || return 0
     [[ "$resolved_root" == "$darwin_temp" ]] || return 0
 
-    # One process listing and one set difference instead of a probe per
-    # registry: the first run on a long-lived temp root can meet tens of
-    # thousands of entries. No listing means every owner is unknown.
-    local live_pids
-    live_pids=$(ps -axo pid= 2> /dev/null | tr -d ' ')
+    # One process listing and set differences instead of a probe per entry:
+    # the first run on a long-lived temp root can meet tens of thousands of
+    # entries. No listing means every owner is unknown, so nothing goes.
+    local live_pids uid
+    live_pids=$(ps -axo pid= 2> /dev/null | tr -d ' ') || return 0
     [[ "$live_pids" =~ [0-9] ]] || return 0
+    uid=$(id -u 2> /dev/null) || return 0
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 0
 
-    local uid token_glob
-    uid=$(id -u)
-    token_glob='mole.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]'
-    find "$resolved_root" -mindepth 1 -maxdepth 1 -name "$token_glob" -user "$uid" \
-        -mmin "+$max_age_minutes" -type f -links 1 \
-        -exec rm -f -- {} + 2> /dev/null || true # SAFE: exact Mole temp names in the Darwin temp root only
-    # rmdir refuses a folder that gained content since the scan.
-    find "$resolved_root" -mindepth 1 -maxdepth 1 -name "$token_glob" -user "$uid" \
-        -mmin "+$max_age_minutes" -type d -empty \
-        -exec rmdir -- {} + 2> /dev/null || true
-
-    # The second -name keeps only digits after the prefix, so every printed
-    # line is one pid and a crafted name cannot add a line. Names stay
-    # relative to the root so no path is rebuilt from text.
+    # Names stay relative to the root so no path is rebuilt from text. Each
+    # list holds one name per line: the token and digit-only globs leave no
+    # room for a crafted name to add a line. "/" is a pattern no name can
+    # equal, so an empty keep list still filters correctly.
     (
         cd "$resolved_root" 2> /dev/null || exit 0
+        local token_glob='mole.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]'
+        local registries live_registries keep
+
+        registries=$(find . -mindepth 1 -maxdepth 1 -name 'mole.registry.[1-9]*' \
+            ! -name 'mole.registry.*[!0-9]*' -user "$uid" -type f -print 2> /dev/null |
+            sed 's#^\./mole\.registry\.##') || exit 0
+        live_registries=$(printf '%s\n' "$registries" |
+            grep -xF -f <(printf '%s\n' "$live_pids") 2> /dev/null) || live_registries=""
+
+        # A Mole run that has been open for more than a day still owns the
+        # entries its registry lists, however old they are.
+        keep="/"
+        if [[ -n "$live_registries" ]]; then
+            keep+=$'\n'$(printf '%s\n' "$live_registries" | sed 's#^#mole.registry.#' |
+                tr '\n' '\0' | xargs -0 cat -- 2> /dev/null | sed 's#^.*/##' |
+                grep -xE 'mole\.[A-Za-z0-9]{6}' 2> /dev/null) || true
+        fi
+
+        find . -mindepth 1 -maxdepth 1 -name "$token_glob" -user "$uid" \
+            -mmin "+$max_age_minutes" -type f -links 1 -print 2> /dev/null |
+            sed 's#^\./##' | grep -vxF -f <(printf '%s\n' "$keep") 2> /dev/null |
+            tr '\n' '\0' | xargs -0 rm -f -- 2> /dev/null # SAFE: unowned Mole temp names in the Darwin temp root only
+        # rmdir refuses a folder that gained content since the scan.
+        find . -mindepth 1 -maxdepth 1 -name "$token_glob" -user "$uid" \
+            -mmin "+$max_age_minutes" -type d -empty -print 2> /dev/null |
+            sed 's#^\./##' | grep -vxF -f <(printf '%s\n' "$keep") 2> /dev/null |
+            tr '\n' '\0' | xargs -0 rmdir -- 2> /dev/null
+
         find . -mindepth 1 -maxdepth 1 -name 'mole.registry.[1-9]*' \
             ! -name 'mole.registry.*[!0-9]*' -user "$uid" \
             -mmin "+$max_age_minutes" -type f -links 1 -print 2> /dev/null |
@@ -1338,6 +1358,7 @@ prune_stale_mole_tmpdir_leftovers() {
             grep -vxF -f <(printf '%s\n' "$live_pids") 2> /dev/null |
             sed 's#^#mole.registry.#' | tr '\n' '\0' |
             xargs -0 rm -f -- 2> /dev/null # SAFE: dead-owner Mole registries in the Darwin temp root only
+        exit 0
     ) || true
 }
 
